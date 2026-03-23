@@ -39,7 +39,7 @@ async function main() {
     await page.waitForTimeout(2000);
 
     // 2. COMPROBAMOS SI EL INPUT DE BÚSQUEDA ESTÁ PRESENTE
-    const selectorInput = 'div#divBusquedaSimple input[name="search"]';
+    const selectorInput = 'input[name="search"]';
     console.log('🔍 Verificando presencia del input de búsqueda...');
     let inputListo = false;
     try {
@@ -70,7 +70,7 @@ async function main() {
       await page.waitForURL(/busqueda-principal-tesis/, { timeout: 30000 });
       console.log('✅ Página de búsqueda cargada mediante menú');
       // Esperamos de nuevo a que el input esté visible
-      await page.waitForSelector(selectorInput, { state: 'visible', timeout: 20000 });
+      await page.waitForSelector(selectorInput, { state: 'visible', timeout: 45000 });
     } else {
       console.log('✅ Página de búsqueda cargada directamente');
     }
@@ -79,12 +79,12 @@ async function main() {
     console.log('3️⃣  Esperando input Desktop...');
     await page.waitForSelector(selectorInput, {
       state: 'visible',
-      timeout: 20000,
+      timeout: 45000,
     });
 
     // Usamos fill (que hace click interno) para introducir el término
     console.log("✍️  Escribiendo 'Inteligencia Artificial'...");
-    await page.fill(selectorInput, 'Inteligencia Artificial');
+    await page.fill(selectorInput, 'fundamentación y motivación acto administrativo');
 
     // 5. ENVIAR LA BÚSQUEDA MEDIANTE ENTER
     console.log('🚀 Enviando con ENTER...');
@@ -95,7 +95,7 @@ async function main() {
     // Ampliamos el timeout para entornos lentos y esperamos la aparición de al
     // menos un elemento de resultado. Alternativamente, podríamos esperar la URL
     // /listado-resultado-de-tesis/.
-    await page.waitForSelector('div.list-group-item.pleca-resultados', {
+    await page.waitForSelector('a.list-group-item.element-item-b1', {
       timeout: 30000,
     });
     console.log('📸 ¡Éxito! Resultados cargados.');
@@ -106,7 +106,7 @@ async function main() {
     // 8. EXTRACCIÓN DE DATOS
     console.log('📄 Extrayendo tesis...');
     const tesis = await page.evaluate(() => {
-      const items = document.querySelectorAll('div.list-group-item.pleca-resultados');
+      const items = document.querySelectorAll('a.list-group-item.element-item-b1');
       return Array.from(items).map((item) => {
         const texto = (item as HTMLElement).innerText;
         // Obtenemos el número de registro y las dos primeras líneas de texto

@@ -1,3 +1,5 @@
 node_modules/
+*.png
+*.jpg
+tesis_final.json
 .env
-dist/

@@ -1,4 +1,5 @@
 import { chromium } from 'playwright';
+import * as fs from 'fs';
 
 async function main() {
   console.log("🚀 Iniciando Misión V2.2: Desambiguación...");
@@ -88,6 +89,10 @@ async function main() {
 
     console.log("📜 MUESTRA DE RESULTADOS:");
     console.log(textos);
+
+    const outputPath = '/home/licjo/jurisprudencia/tesis_test.json';
+    fs.writeFileSync(outputPath, JSON.stringify(textos, null, 2));
+    console.log(`💾 Guardado en ${outputPath}`);
 
   } catch (error) {
     console.error("❌ Error:", error);
