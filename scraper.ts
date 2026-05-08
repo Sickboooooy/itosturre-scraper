@@ -81,7 +81,7 @@ async function main() {
         // Intentamos pescar los rubros (títulos)
         // Usamos selectores comunes de tablas o listas
         const rubros = Array.from(document.querySelectorAll('td, h4, div[role="row"]'))
-            .map(e => e.innerText)
+            .map(e => (e as HTMLElement).innerText)
             .filter(t => t.length > 50) // Filtramos textos cortos
             .slice(0, 3);
         return rubros;
