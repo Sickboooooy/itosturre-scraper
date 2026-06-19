@@ -175,6 +175,17 @@ function evaluarAplicabilidad(
   return { estado, razon, petitorio, forma_cita, combinado };
 }
 
+// ── UTILIDADES ────────────────────────────────────────────────────────────────
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Delay aleatorio entre requests al SJF para no disparar rate-limiting / bloqueo de IP
+// a media demo en vivo frente a un prospecto.
+function delayAntiRateLimit(): Promise<void> {
+  return sleep(500 + Math.random() * 1000);
+}
+
 // ── BÚSQUEDA DE CANDIDATOS EN SJF ─────────────────────────────────────────────
 async function buscarCandidatosSJF(page: Page, termino: string, max = 6, yaVistos: Set<string> = new Set()): Promise<string[]> {
   console.log(`  [BUSQUEDA] "${termino}"`);
@@ -274,10 +285,15 @@ async function auditarRegistro(
 
     console.log(`  [${estado}] ${registro} — tipo:${score_tipo} rel:${score_relevancia} comb:${combinado} (${datos.tipo_tesis}) — ${datos.materia}`);
 
+    // El semáforo visual debe reflejar la decisión final (estado), no solo el tipo de
+    // tesis: con contexto, una tesis puede tener score_tipo alto (jurisprudencia) pero
+    // quedar DESCARTADA por baja relevancia al caso — el emoji no puede contradecir eso.
+    const semaforoFinal = estado === 'DESCARTADO' ? '🔴' : estado === 'PARCIAL' ? '🟡' : '🟢';
+
     return {
       ...datos, url, screenshot: screenshotPath,
       score_tipo, score_relevancia, score_combinado: combinado,
-      vvca_semaforo: semaforo, vvca_observacion: obs,
+      vvca_semaforo: semaforoFinal, vvca_observacion: obs,
       estado, razon_estado: razon,
       petitorio_sugerido: petitorio, forma_cita,
       es_propuesta: esPropuesta, busqueda_origen: busquedaOrigen || undefined,
@@ -345,49 +361,61 @@ async function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true });
 
   const browser = await chromium.launch({ headless: true, args: ['--no-sandbox','--disable-setuid-sandbox','--disable-gpu'] });
-  const ctx     = await browser.newContext({
-    viewport:  { width: 1440, height: 900 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
-  });
 
-  // ── FASE 1: Auditar registros originales ──────────────────────────────────
-  console.log('── FASE 1: Verificacion de registros ──');
+  // Declarados fuera del try para seguir disponibles en la salida JSON/reporte
+  // aunque algo falle a media ejecución (se guarda lo que se haya alcanzado a auditar).
   const verificados: TesisVVCA[] = [];
-  for (const reg of registros) {
-    verificados.push(await auditarRegistro(ctx, reg, casoCtx, false, ''));
-  }
-
-  // ── FASE 2: Buscar alternativas para descartados (sólo con contexto) ──────
   const propuestas: TesisVVCA[] = [];
-  const yaVistos = new Set(registros);
 
-  if (casoCtx) {
-    const descartados = verificados.filter(t => t.estado === 'DESCARTADO');
-    if (descartados.length > 0) {
-      console.log(`\n── FASE 2: Busqueda automatica de alternativas (${descartados.length} descartado(s)) ──`);
-      const searchPage = await ctx.newPage();
-      const terminos   = terminesBusquedaAlternativos(casoCtx, descartados);
+  try {
+    const ctx = await browser.newContext({
+      viewport:  { width: 1440, height: 900 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+    });
 
-      for (const termino of terminos) {
-        const candidatos = await buscarCandidatosSJF(searchPage, termino, 4, yaVistos);
-        for (const reg of candidatos) {
-          yaVistos.add(reg);
-          const tesis = await auditarRegistro(ctx, reg, casoCtx, true, termino);
-          if (tesis.estado !== 'DESCARTADO') {
-            propuestas.push(tesis);
-            console.log(`  [+] Propuesta aceptada: ${reg} (score_comb: ${tesis.score_combinado})`);
-          }
-          if (propuestas.length >= 5) break;
-        }
-        if (propuestas.length >= 5) break;
-      }
-      await searchPage.close();
-    } else {
-      console.log('\n[OK] Todos los registros son aplicables — no se requieren alternativas.');
+    // ── FASE 1: Auditar registros originales ──────────────────────────────────
+    console.log('── FASE 1: Verificacion de registros ──');
+    for (const reg of registros) {
+      verificados.push(await auditarRegistro(ctx, reg, casoCtx, false, ''));
+      await delayAntiRateLimit();
     }
-  }
 
-  await browser.close();
+    // ── FASE 2: Buscar alternativas para descartados (sólo con contexto) ──────
+    const yaVistos = new Set(registros);
+
+    if (casoCtx) {
+      const descartados = verificados.filter(t => t.estado === 'DESCARTADO');
+      if (descartados.length > 0) {
+        console.log(`\n── FASE 2: Busqueda automatica de alternativas (${descartados.length} descartado(s)) ──`);
+        const searchPage = await ctx.newPage();
+        try {
+          const terminos = terminesBusquedaAlternativos(casoCtx, descartados);
+
+          for (const termino of terminos) {
+            const candidatos = await buscarCandidatosSJF(searchPage, termino, 4, yaVistos);
+            await delayAntiRateLimit();
+            for (const reg of candidatos) {
+              yaVistos.add(reg);
+              const tesis = await auditarRegistro(ctx, reg, casoCtx, true, termino);
+              await delayAntiRateLimit();
+              if (tesis.estado !== 'DESCARTADO') {
+                propuestas.push(tesis);
+                console.log(`  [+] Propuesta aceptada: ${reg} (score_comb: ${tesis.score_combinado})`);
+              }
+              if (propuestas.length >= 5) break;
+            }
+            if (propuestas.length >= 5) break;
+          }
+        } finally {
+          await searchPage.close();
+        }
+      } else {
+        console.log('\n[OK] Todos los registros son aplicables — no se requieren alternativas.');
+      }
+    }
+  } finally {
+    await browser.close();
+  }
 
   // ── SALIDA JSON ───────────────────────────────────────────────────────────
   const salida = { verificados, propuestas };
