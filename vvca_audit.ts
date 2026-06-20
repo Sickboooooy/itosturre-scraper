@@ -94,7 +94,7 @@ function calcularRelevancia(
   let score = 25;
 
   // Materia match
-  const termsMat = MATERIAS[ctx.materia_principal] ?? [ctx.materia_principal.toLowerCase()];
+  const termsMat = MATERIAS[ctx.materia_principal] ?? [(ctx.materia_principal ?? '').toLowerCase()].filter(Boolean);
   if (termsMat.some(m => mat.includes(m))) {
     score += 30;
   } else if (/común|constitucional/i.test(mat)) {
@@ -318,9 +318,9 @@ async function auditarRegistro(
 // ── CONSTRUIR TÉRMINOS DE BÚSQUEDA ALTERNATIVOS ───────────────────────────────
 function terminesBusquedaAlternativos(casoCtx: CasoContexto, descartadas: TesisVVCA[]): string[] {
   // Términos del caso ordenados por prioridad
-  const base = casoCtx.temas.map(t => `${t} ${casoCtx.materia_principal}`);
+  const base = (casoCtx.temas ?? []).map(t => `${t} ${casoCtx.materia_principal ?? ''}`);
   // Términos de los petitorios
-  const dePetitorios = casoCtx.petitorios.map(p => p);
+  const dePetitorios = (casoCtx.petitorios ?? []).map(p => p);
   // Términos genéricos por materia
   const genericos: Record<string, string[]> = {
     familiar: ['interes superior menor familiar', 'prueba familiar derecho menor', 'facultad juzgador familiar'],
