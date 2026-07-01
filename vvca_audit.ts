@@ -12,7 +12,7 @@ import { chromium } from 'playwright';
 import type { BrowserContext, Page } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
-import { pathToFileURL } from 'url';
+import { pathToFileURL, fileURLToPath } from 'url';
 
 // ── VIGENCIA DE TESIS (falso verde) ────────────────────────────────────────────
 // Detecta si el criterio de una tesis fue superado/interrumpido/sustituido a partir de la
@@ -59,6 +59,40 @@ const OUT_DIR        = outFlagIdx  !== -1 ? process.argv[outFlagIdx  + 1] : DEFA
 const CONTEXTO_FILE  = ctxFlagIdx  !== -1 ? process.argv[ctxFlagIdx  + 1] : null;
 
 const SJF_SEARCH = 'https://sjf2.scjn.gob.mx/busqueda-principal-tesis';
+
+// ── CACHÉ / RESILIENCIA ────────────────────────────────────────────────────────
+// El scraper del SJF es el punto único de falla del foso VVCA. Caché por registro (los datos
+// de una tesis publicada no cambian salvo su vigencia) + reintentos + detección de cambio de
+// layout. `--no-cache` fuerza SJF en vivo; `--cache-ttl-dias N` ajusta la frescura (default 30).
+const SCRIPT_DIR      = path.dirname(fileURLToPath(import.meta.url));
+const CACHE_DIR       = path.join(SCRIPT_DIR, '.sjf_cache');
+const USAR_CACHE      = !process.argv.includes('--no-cache');
+const ttlFlagIdx      = process.argv.indexOf('--cache-ttl-dias');
+const CACHE_TTL_DIAS  = ttlFlagIdx !== -1 ? (Number(process.argv[ttlFlagIdx + 1]) || 30) : 30;
+
+// Datos crudos extraídos del detalle SJF (lo que se cachea; scoring y vigencia se recomputan).
+interface DatosSJF {
+  registro: string; rubro: string; numero_tesis: string; tipo_tesis: string;
+  sala: string; epoca: string; materia: string; fuente: string;
+  texto_completo: string; notas_raw: string;
+}
+
+function leerCacheDatos(reg: string): DatosSJF | null {
+  try {
+    const f = path.join(CACHE_DIR, `${reg}.json`);
+    if (!fs.existsSync(f)) return null;
+    const edadDias = (Date.now() - fs.statSync(f).mtimeMs) / 86_400_000;
+    if (edadDias > CACHE_TTL_DIAS) return null; // caché vencida → re-scrapear
+    return JSON.parse(fs.readFileSync(f, 'utf-8')) as DatosSJF;
+  } catch { return null; }
+}
+
+function escribirCacheDatos(reg: string, datos: DatosSJF): void {
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(path.join(CACHE_DIR, `${reg}.json`), JSON.stringify(datos, null, 2), 'utf-8');
+  } catch { /* caché best-effort — nunca aborta la auditoría */ }
+}
 
 // ── INTERFACES ────────────────────────────────────────────────────────────────
 interface CasoContexto {
@@ -263,26 +297,28 @@ async function buscarCandidatosSJF(page: Page, termino: string, max = 6, yaVisto
 }
 
 // ── AUDITAR UN REGISTRO ───────────────────────────────────────────────────────
-async function auditarRegistro(
-  ctx: BrowserContext,
-  registro: string,
-  casoCtx: CasoContexto | null,
-  esPropuesta = false,
-  busquedaOrigen = ''
-): Promise<TesisVVCA> {
-  const url            = `https://sjf2.scjn.gob.mx/detalle/tesis/${registro}`;
-  const screenshotPath = path.join(OUT_DIR, `sjf_${registro}.png`);
-  const page           = await ctx.newPage();
+function tesisError(registro: string, url: string, esPropuesta: boolean, busquedaOrigen: string): TesisVVCA {
+  return {
+    registro, rubro: 'ERROR — no se pudo conectar al SJF', numero_tesis: '', tipo_tesis: '',
+    sala: '', epoca: '', materia: '', fuente: '', texto_completo: '',
+    estado_vigencia: 'vigente', notas_vigencia: '',
+    url, screenshot: '',
+    score_tipo: 0, score_relevancia: 0, score_combinado: 0,
+    vvca_semaforo: '🔴', vvca_observacion: 'Error de conexión al SJF.',
+    estado: 'DESCARTADO', razon_estado: 'Error al conectar con SJF (tras reintentos).',
+    petitorio_sugerido: '', forma_cita: 'NO CITAR',
+    es_propuesta: esPropuesta, busqueda_origen: busquedaOrigen || undefined,
+  };
+}
 
-  try {
-    console.log(`  [${esPropuesta ? 'PROPUESTA' : 'AUDIT'}] ${registro} — conectando SJF...`);
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
-    await page.waitForFunction(
-      () => document.body.innerText.includes('Registro digital:'),
-      { timeout: 30000 }
-    );
-
-    const datos = await page.evaluate((reg: string) => {
+// Una navegación al detalle SJF → datos crudos + screenshot (requiere la página viva).
+async function extraerDatosSJF(page: Page, registro: string, url: string, screenshotPath: string): Promise<DatosSJF> {
+  await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+  await page.waitForFunction(
+    () => document.body.innerText.includes('Registro digital:'),
+    { timeout: 30000 }
+  );
+  const datos = await page.evaluate((reg: string) => {
       const lineas = document.body.innerText.split('\n').map((l: string) => l.trim()).filter(Boolean);
       const get = (clave: string) => {
         const i = lineas.findIndex((l: string) => new RegExp(`^${clave}\\s*:?\\s*`, 'i').test(l));
@@ -327,59 +363,96 @@ async function auditarRegistro(
         sala: get('Instancia'), epoca: epocaFull.replace(/\s*".*"$/,'').trim(),
         materia, fuente: get('Fuente'), texto_completo, notas_raw,
       };
-    }, registro);
+    }, registro) as DatosSJF;
 
-    await page.addStyleTag({ content: '.alert,[class*="alert"],.cookie-banner{display:none!important}' });
-    await page.screenshot({ path: screenshotPath, fullPage: false });
+  await page.addStyleTag({ content: '.alert,[class*="alert"],.cookie-banner{display:none!important}' });
+  await page.screenshot({ path: screenshotPath, fullPage: false });
+  return datos;
+}
 
-    // Vigencia del criterio (falso verde) — parseada de la sección NOTAS del detalle SJF.
-    const { notas_raw, ...datosBase } = datos as typeof datos & { notas_raw?: string };
-    const { estado_vigencia, notas_vigencia } = detectarVigencia(notas_raw ?? '');
-    if (estado_vigencia !== 'vigente') {
-      console.log(`  [VIGENCIA] ${registro} — criterio ${estado_vigencia.toUpperCase()}: ${notas_vigencia.slice(0, 90)}`);
+// Scrapea con reintentos: el SJF a veces tarda o corta la conexión bajo carga.
+async function scrapearConReintentos(
+  ctx: BrowserContext, registro: string, url: string, screenshotPath: string, intentos = 2,
+): Promise<DatosSJF> {
+  let ultimo: Error | null = null;
+  for (let i = 1; i <= intentos; i++) {
+    const page = await ctx.newPage();
+    try {
+      return await extraerDatosSJF(page, registro, url, screenshotPath);
+    } catch (err) {
+      ultimo = err as Error;
+      if (i < intentos) {
+        console.log(`  [RETRY ${i}/${intentos - 1}] ${registro} — ${ultimo.message.slice(0, 60)}`);
+        await new Promise(r => setTimeout(r, 1500 * i));
+      }
+    } finally {
+      await page.close();
     }
-
-    const { score: score_tipo, semaforo, obs } = scorePorTipo(datos.tipo_tesis ?? '');
-    const score_relevancia = casoCtx
-      ? calcularRelevancia(datos.rubro ?? '', datos.texto_completo ?? '', datos.materia ?? '', datos.sala ?? '', casoCtx)
-      : 0;
-    const { estado, razon, petitorio, forma_cita, combinado } = evaluarAplicabilidad(
-      score_tipo, score_relevancia,
-      datos.tipo_tesis ?? '', datos.materia ?? '', datos.rubro ?? '',
-      esPropuesta, casoCtx
-    );
-
-    console.log(`  [${estado}] ${registro} — tipo:${score_tipo} rel:${score_relevancia} comb:${combinado} (${datos.tipo_tesis}) — ${datos.materia}`);
-
-    // El semáforo visual debe reflejar la decisión final (estado), no solo el tipo de
-    // tesis: con contexto, una tesis puede tener score_tipo alto (jurisprudencia) pero
-    // quedar DESCARTADA por baja relevancia al caso — el emoji no puede contradecir eso.
-    const semaforoFinal = estado === 'DESCARTADO' ? '🔴' : estado === 'PARCIAL' ? '🟡' : '🟢';
-
-    return {
-      ...datosBase, estado_vigencia, notas_vigencia, url, screenshot: screenshotPath,
-      score_tipo, score_relevancia, score_combinado: combinado,
-      vvca_semaforo: semaforoFinal, vvca_observacion: obs,
-      estado, razon_estado: razon,
-      petitorio_sugerido: petitorio, forma_cita,
-      es_propuesta: esPropuesta, busqueda_origen: busquedaOrigen || undefined,
-    };
-  } catch (err) {
-    console.error(`  [ERROR] ${registro}:`, (err as Error).message);
-    return {
-      registro, rubro: 'ERROR — no se pudo conectar al SJF', numero_tesis: '', tipo_tesis: '',
-      sala: '', epoca: '', materia: '', fuente: '', texto_completo: '',
-      estado_vigencia: 'vigente', notas_vigencia: '',
-      url, screenshot: '',
-      score_tipo: 0, score_relevancia: 0, score_combinado: 0,
-      vvca_semaforo: '🔴', vvca_observacion: 'Error de conexión al SJF.',
-      estado: 'DESCARTADO', razon_estado: 'Error al conectar con SJF.',
-      petitorio_sugerido: '', forma_cita: 'NO CITAR',
-      es_propuesta: esPropuesta, busqueda_origen: busquedaOrigen || undefined,
-    };
-  } finally {
-    await page.close();
   }
+  throw ultimo ?? new Error('scrape SJF falló');
+}
+
+async function auditarRegistro(
+  ctx: BrowserContext,
+  registro: string,
+  casoCtx: CasoContexto | null,
+  esPropuesta = false,
+  busquedaOrigen = ''
+): Promise<TesisVVCA> {
+  const url            = `https://sjf2.scjn.gob.mx/detalle/tesis/${registro}`;
+  const screenshotPath = path.join(OUT_DIR, `sjf_${registro}.png`);
+
+  // 1) Caché por registro (resiliencia + no martillar el SJF).
+  let datos: DatosSJF | null = USAR_CACHE ? leerCacheDatos(registro) : null;
+  if (datos) {
+    console.log(`  [CACHE] ${registro} — copia local (sin tocar el SJF).`);
+  } else {
+    console.log(`  [${esPropuesta ? 'PROPUESTA' : 'AUDIT'}] ${registro} — conectando SJF...`);
+    try {
+      datos = await scrapearConReintentos(ctx, registro, url, screenshotPath);
+    } catch (err) {
+      console.error(`  [ERROR] ${registro}:`, (err as Error).message);
+      return tesisError(registro, url, esPropuesta, busquedaOrigen);
+    }
+    // 2) Detección de cambio de layout: campos clave vacíos ⇒ el DOM del SJF pudo cambiar.
+    if (!datos.rubro && !datos.numero_tesis) {
+      console.warn(`  [LAYOUT?] ${registro} — rubro y número vacíos; posible cambio de estructura del SJF (no se cachea).`);
+    } else {
+      escribirCacheDatos(registro, datos);
+    }
+  }
+
+  // 3) Vigencia + scoring (idéntico venga de caché o de SJF en vivo).
+  const { notas_raw, ...datosBase } = datos as DatosSJF;
+  const { estado_vigencia, notas_vigencia } = detectarVigencia(notas_raw ?? '');
+  if (estado_vigencia !== 'vigente') {
+    console.log(`  [VIGENCIA] ${registro} — criterio ${estado_vigencia.toUpperCase()}: ${notas_vigencia.slice(0, 90)}`);
+  }
+
+  const { score: score_tipo, obs } = scorePorTipo(datosBase.tipo_tesis ?? '');
+  const score_relevancia = casoCtx
+    ? calcularRelevancia(datosBase.rubro ?? '', datosBase.texto_completo ?? '', datosBase.materia ?? '', datosBase.sala ?? '', casoCtx)
+    : 0;
+  const { estado, razon, petitorio, forma_cita, combinado } = evaluarAplicabilidad(
+    score_tipo, score_relevancia,
+    datosBase.tipo_tesis ?? '', datosBase.materia ?? '', datosBase.rubro ?? '',
+    esPropuesta, casoCtx
+  );
+
+  console.log(`  [${estado}] ${registro} — tipo:${score_tipo} rel:${score_relevancia} comb:${combinado} (${datosBase.tipo_tesis}) — ${datosBase.materia}`);
+
+  // El semáforo visual refleja la decisión final (estado), no solo el tipo de tesis.
+  const semaforoFinal = estado === 'DESCARTADO' ? '🔴' : estado === 'PARCIAL' ? '🟡' : '🟢';
+
+  return {
+    ...datosBase, estado_vigencia, notas_vigencia, url,
+    screenshot: fs.existsSync(screenshotPath) ? screenshotPath : '',
+    score_tipo, score_relevancia, score_combinado: combinado,
+    vvca_semaforo: semaforoFinal, vvca_observacion: obs,
+    estado, razon_estado: razon,
+    petitorio_sugerido: petitorio, forma_cita,
+    es_propuesta: esPropuesta, busqueda_origen: busquedaOrigen || undefined,
+  };
 }
 
 // ── CONSTRUIR TÉRMINOS DE BÚSQUEDA ALTERNATIVOS ───────────────────────────────
