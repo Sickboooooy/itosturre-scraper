@@ -12,6 +12,44 @@ import { chromium } from 'playwright';
 import type { BrowserContext, Page } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
+import { pathToFileURL } from 'url';
+
+// ── VIGENCIA DE TESIS (falso verde) ────────────────────────────────────────────
+// Detecta si el criterio de una tesis fue superado/interrumpido/sustituido a partir de la
+// sección NOTAS/EJECUTORIAS del detalle SJF. El campo resultante `estado_vigencia` viaja al
+// corpus local jurisprudencia/*.json, donde OpenNotebook.build_vvca_tesis lo lee y
+// scoring_vvca.veredicto_global lo convierte en 🔴 bloqueante (parámetro tesis_superadas).
+//
+// PRECISIÓN > cobertura (a propósito): patrones AFIRMATIVOS ("fue/quedó/se + superada…") + guardia
+// de negación. Ante la duda ⇒ 'vigente'. Un falso positivo bloquearía una tesis válida (peor que
+// no proteger). Pruebas en vigencia.test.ts (npx ts-node compila → node).
+export type EstadoVigencia = 'vigente' | 'superada' | 'interrumpida' | 'sustituida';
+
+const VIGENCIA_PATRONES: Array<[EstadoVigencia, RegExp]> = [
+  [
+    'superada',
+    /\b(?:fue|ha\s+sido|qued[oó]|result[oó]|se)\s+superad\w*|dej[oó]\s+de\s+(?:tener|considerarse|ser)\b[^.]{0,60}(?:jurisprudencia|aplicaci[oó]n\s+obligatoria|obligatori\w*|aplicable)|ya\s+no\s+(?:resulta|es|se\s+considera)\b[^.]{0,40}(?:aplicable|obligatori\w*)/i,
+  ],
+  ['interrumpida', /\b(?:fue|ha\s+sido|qued[oó]|se)\s+interrump[a-záéíóú]*|interrump[a-záéíóú]*\s+(?:el|la|dicho|dicha)\s+(?:criterio|jurisprudencia|tesis)/i],
+  ['sustituida', /\b(?:fue|ha\s+sido|qued[oó]|se)\s+sustitu[a-záéíóú]*|sustituy[a-záéíóú]*\s+(?:por|la\s+(?:presente|diversa|tesis))/i],
+];
+
+const VIGENCIA_NEGACION = /(desechad|negad|improcedente|sin\s+materia|se\s+mantiene|subsiste|(?:contin[uú]a|sigue)\s+(?:firme|vigente|aplicable))/i;
+
+/** Detecta el estado de vigencia desde el texto de la sección NOTAS. Vacío ⇒ 'vigente'. */
+export function detectarVigencia(notas: string): { estado_vigencia: EstadoVigencia; notas_vigencia: string } {
+  const scan = (notas || '').trim();
+  if (!scan) return { estado_vigencia: 'vigente', notas_vigencia: '' };
+  for (const [estado, re] of VIGENCIA_PATRONES) {
+    const m = scan.match(re);
+    if (!m) continue;
+    const idx = m.index ?? 0;
+    const ventana = scan.slice(Math.max(0, idx - 60), idx + 160);
+    if (VIGENCIA_NEGACION.test(ventana)) continue; // desestimada → no pierde vigencia
+    return { estado_vigencia: estado, notas_vigencia: ventana.replace(/\s+/g, ' ').trim() };
+  }
+  return { estado_vigencia: 'vigente', notas_vigencia: '' };
+}
 
 // ── FLAGS ─────────────────────────────────────────────────────────────────────
 const outFlagIdx     = process.argv.indexOf('--out');
@@ -44,6 +82,9 @@ interface TesisVVCA {
   materia:             string;
   fuente:              string;
   texto_completo:      string;
+  // Vigencia del criterio (falso verde) — parseada de la sección NOTAS del SJF
+  estado_vigencia:     EstadoVigencia; // 'vigente' | 'superada' | 'interrumpida' | 'sustituida'
+  notas_vigencia:      string;         // fragmento que lo justifica ('' si vigente)
   url:                 string;
   screenshot:          string;
   // Scores VVCA
@@ -261,17 +302,42 @@ async function auditarRegistro(
       const materia = lineas.find((l: string) => /^Materia/i.test(l))
         ?.replace(/^Materia\([^)]*\)\s*:\s*/i, '').replace(/^Materia\s*:\s*/i, '') ?? '';
       const epocaFull = lineas.find((l: string) => /época/i.test(l) && !/materia|instancia/i.test(l)) ?? '';
+
+      // Sección NOTAS/EJECUTORIAS (donde el SJF publica la pérdida de vigencia). Se corta al
+      // llegar al pie institucional. Si no hay sección rotulada, se rescatan líneas
+      // auto-referenciales "Esta tesis fue …" para casos de nota embebida en el cuerpo.
+      const esPie = (l: string) => /(suprema corte de justicia de la naci|cont[aá]ctanos|redes sociales|ubicaci[oó]n|derechos reservados|©|pino su[aá]rez)/i.test(l);
+      let notas_raw = '';
+      const notaIdx = lineas.findIndex((l: string) => /^(notas?|ejecutorias?)\b/i.test(l));
+      if (notaIdx !== -1) {
+        let end = lineas.length;
+        for (let j = notaIdx + 1; j < lineas.length; j++) { if (esPie(lineas[j])) { end = j; break; } }
+        notas_raw = lineas.slice(notaIdx, end).join('\n').slice(0, 3000);
+      } else {
+        notas_raw = lineas
+          .filter((l: string) => /(esta tesis|la presente tesis|este criterio|dicha tesis|dicho criterio)\s+(fue|ha sido|qued[oó]|dej[oó]|ya no)/i.test(l))
+          .join('\n')
+          .slice(0, 2000);
+      }
+
       return {
         registro: reg, rubro,
         numero_tesis: lineas.find((l: string) => /^Tesis\s*:/i.test(l))?.replace(/^Tesis\s*:\s*/i,'') ?? '',
         tipo_tesis: get('Tipo'),
         sala: get('Instancia'), epoca: epocaFull.replace(/\s*".*"$/,'').trim(),
-        materia, fuente: get('Fuente'), texto_completo,
+        materia, fuente: get('Fuente'), texto_completo, notas_raw,
       };
     }, registro);
 
     await page.addStyleTag({ content: '.alert,[class*="alert"],.cookie-banner{display:none!important}' });
     await page.screenshot({ path: screenshotPath, fullPage: false });
+
+    // Vigencia del criterio (falso verde) — parseada de la sección NOTAS del detalle SJF.
+    const { notas_raw, ...datosBase } = datos as typeof datos & { notas_raw?: string };
+    const { estado_vigencia, notas_vigencia } = detectarVigencia(notas_raw ?? '');
+    if (estado_vigencia !== 'vigente') {
+      console.log(`  [VIGENCIA] ${registro} — criterio ${estado_vigencia.toUpperCase()}: ${notas_vigencia.slice(0, 90)}`);
+    }
 
     const { score: score_tipo, semaforo, obs } = scorePorTipo(datos.tipo_tesis ?? '');
     const score_relevancia = casoCtx
@@ -291,7 +357,7 @@ async function auditarRegistro(
     const semaforoFinal = estado === 'DESCARTADO' ? '🔴' : estado === 'PARCIAL' ? '🟡' : '🟢';
 
     return {
-      ...datos, url, screenshot: screenshotPath,
+      ...datosBase, estado_vigencia, notas_vigencia, url, screenshot: screenshotPath,
       score_tipo, score_relevancia, score_combinado: combinado,
       vvca_semaforo: semaforoFinal, vvca_observacion: obs,
       estado, razon_estado: razon,
@@ -303,6 +369,7 @@ async function auditarRegistro(
     return {
       registro, rubro: 'ERROR — no se pudo conectar al SJF', numero_tesis: '', tipo_tesis: '',
       sala: '', epoca: '', materia: '', fuente: '', texto_completo: '',
+      estado_vigencia: 'vigente', notas_vigencia: '',
       url, screenshot: '',
       score_tipo: 0, score_relevancia: 0, score_combinado: 0,
       vvca_semaforo: '🔴', vvca_observacion: 'Error de conexión al SJF.',
@@ -447,4 +514,8 @@ async function main() {
   console.log(`JSON: ${jsonPath}`);
 }
 
-main();
+// Ejecuta main() solo cuando el archivo es el punto de entrada (no al importarlo desde
+// vigencia.test.ts, que reutiliza detectarVigencia sin arrancar el scraper).
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+  main();
+}
