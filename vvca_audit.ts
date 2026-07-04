@@ -69,6 +69,10 @@ const CACHE_DIR       = path.join(SCRIPT_DIR, '.sjf_cache');
 const USAR_CACHE      = !process.argv.includes('--no-cache');
 const ttlFlagIdx      = process.argv.indexOf('--cache-ttl-dias');
 const CACHE_TTL_DIAS  = ttlFlagIdx !== -1 ? (Number(process.argv[ttlFlagIdx + 1]) || 30) : 30;
+// Los DATOS de una tesis publicada no cambian, pero su VIGENCIA sí puede perderse en cualquier
+// momento (superación/interrupción). Ventana corta para confiar en un 'vigente' cacheado; más
+// allá, se avisa que para uso procesal final conviene re-verificar en vivo (--no-cache).
+const VIGENCIA_FRESCURA_DIAS = 7;
 
 // Datos crudos extraídos del detalle SJF (lo que se cachea; scoring y vigencia se recomputan).
 interface DatosSJF {
@@ -85,6 +89,14 @@ function leerCacheDatos(reg: string): DatosSJF | null {
     if (edadDias > CACHE_TTL_DIAS) return null; // caché vencida → re-scrapear
     return JSON.parse(fs.readFileSync(f, 'utf-8')) as DatosSJF;
   } catch { return null; }
+}
+
+function edadCacheDias(reg: string): number {
+  try {
+    const f = path.join(CACHE_DIR, `${reg}.json`);
+    if (!fs.existsSync(f)) return -1;
+    return (Date.now() - fs.statSync(f).mtimeMs) / 86_400_000;
+  } catch { return -1; }
 }
 
 function escribirCacheDatos(reg: string, datos: DatosSJF): void {
@@ -403,7 +415,9 @@ async function auditarRegistro(
   const screenshotPath = path.join(OUT_DIR, `sjf_${registro}.png`);
 
   // 1) Caché por registro (resiliencia + no martillar el SJF).
+  const cacheEdadDias = USAR_CACHE ? edadCacheDias(registro) : -1;
   let datos: DatosSJF | null = USAR_CACHE ? leerCacheDatos(registro) : null;
+  const desdeCache = !!datos;
   if (datos) {
     console.log(`  [CACHE] ${registro} — copia local (sin tocar el SJF).`);
   } else {
@@ -427,6 +441,10 @@ async function auditarRegistro(
   const { estado_vigencia, notas_vigencia } = detectarVigencia(notas_raw ?? '');
   if (estado_vigencia !== 'vigente') {
     console.log(`  [VIGENCIA] ${registro} — criterio ${estado_vigencia.toUpperCase()}: ${notas_vigencia.slice(0, 90)}`);
+  } else if (desdeCache && cacheEdadDias > VIGENCIA_FRESCURA_DIAS) {
+    // Falso verde por caché añeja: el 'vigente' es de hace días; la tesis pudo ser superada
+    // después. No cambia el veredicto (los datos son estables), pero se avisa el riesgo temporal.
+    console.warn(`  [VIGENCIA?] ${registro} — 'vigente' proviene de caché de hace ${Math.round(cacheEdadDias)}d; una tesis puede ser superada después. Para uso procesal final, re-verifica en vivo (--no-cache).`);
   }
 
   const { score: score_tipo, obs } = scorePorTipo(datosBase.tipo_tesis ?? '');
