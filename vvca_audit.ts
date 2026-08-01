@@ -13,6 +13,15 @@ import type { BrowserContext, Page } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
 import { pathToFileURL, fileURLToPath } from 'url';
+import {
+  SJF_PORTALS,
+  aggregateFailureStatus,
+  buildDetailUrl,
+  buildSearchUrl,
+  classifySjfFailure,
+  type SjfAttemptTrace,
+  type SjfPortal,
+} from './sjf_resilience.ts';
 
 // ── VIGENCIA DE TESIS (falso verde) ────────────────────────────────────────────
 // Detecta si el criterio de una tesis fue superado/interrumpido/sustituido a partir de la
@@ -58,8 +67,6 @@ const DEFAULT_OUT    = 'c:\\Users\\licjo\\.itosturre\\itosturre-agente\\auditori
 const OUT_DIR        = outFlagIdx  !== -1 ? process.argv[outFlagIdx  + 1] : DEFAULT_OUT;
 const CONTEXTO_FILE  = ctxFlagIdx  !== -1 ? process.argv[ctxFlagIdx  + 1] : null;
 
-const SJF_SEARCH = 'https://sjf2.scjn.gob.mx/busqueda-principal-tesis';
-
 // ── CACHÉ / RESILIENCIA ────────────────────────────────────────────────────────
 // El scraper del SJF es el punto único de falla del foso VVCA. Caché por registro (los datos
 // de una tesis publicada no cambian salvo su vigencia) + reintentos + detección de cambio de
@@ -79,7 +86,12 @@ interface DatosSJF {
   registro: string; rubro: string; numero_tesis: string; tipo_tesis: string;
   sala: string; epoca: string; materia: string; fuente: string;
   texto_completo: string; notas_raw: string;
+  origen_url?: string; capturado_en?: string;
 }
+
+type ScrapeFallbackResult =
+  | { ok: true; datos: DatosSJF; portal: SjfPortal; url: string; attempts: SjfAttemptTrace[] }
+  | { ok: false; url: string; attempts: SjfAttemptTrace[] };
 
 function leerCacheDatos(reg: string): DatosSJF | null {
   try {
@@ -117,6 +129,7 @@ interface CasoContexto {
 }
 
 type EstadoAplicabilidad = 'APLICABLE' | 'PARCIAL' | 'DESCARTADO' | 'PROPUESTA';
+type EstadoConsultaSJF = 'VERIFICADO' | 'NO_ENCONTRADO' | 'NO_VERIFICABLE' | 'LAYOUT_INCOMPATIBLE';
 
 interface TesisVVCA {
   registro:            string;
@@ -146,6 +159,13 @@ interface TesisVVCA {
   forma_cita:          string;  // 'CITAR DIRECTO' | 'CITAR CON RESERVA' | 'NO CITAR'
   es_propuesta:        boolean; // true = encontrada de oficio como alternativa
   busqueda_origen?:    string;  // término de búsqueda que la encontró
+  estado_consulta:     EstadoConsultaSJF;
+  origen_consulta:     'cache' | 'sjf2' | 'sjfsemanal' | 'ninguno';
+  consultado_en:       string;
+  trazabilidad_consulta: {
+    schema_version: '1.0';
+    attempts: SjfAttemptTrace[];
+  };
 }
 
 // ── SCORING POR TIPO ──────────────────────────────────────────────────────────
@@ -274,62 +294,108 @@ function delayAntiRateLimit(): Promise<void> {
 }
 
 // ── BÚSQUEDA DE CANDIDATOS EN SJF ─────────────────────────────────────────────
-async function buscarCandidatosSJF(page: Page, termino: string, max = 6, yaVistos: Set<string> = new Set()): Promise<string[]> {
+async function buscarCandidatosSJF(
+  page: Page, termino: string, max = 6, yaVistos: Set<string> = new Set(),
+): Promise<{ registros: string[]; traces: SjfAttemptTrace[] }> {
   console.log(`  [BUSQUEDA] "${termino}"`);
-  try {
-    await page.goto(SJF_SEARCH, { waitUntil: 'networkidle', timeout: 45000 });
+  const traces: SjfAttemptTrace[] = [];
+  for (const portal of SJF_PORTALS) {
+    const url = buildSearchUrl(portal);
+    const started = new Date().toISOString();
+    try {
+      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      if (response?.status() === 403) throw new Error('SJF_ACCESS_BLOCKED: HTTP 403');
+      if (response?.status() === 404) throw new Error('SJF_NOT_FOUND: HTTP 404');
+      await page.waitForTimeout(2500);
 
-    // Llenar campo de búsqueda
-    const inputSel = 'input[type="text"], input[type="search"]';
-    await page.waitForSelector(inputSel, { timeout: 10000 }).catch(() => null);
-    const inputs = await page.$$(inputSel);
-    if (inputs.length > 0) {
+      const inputSel = 'input[type="text"], input[type="search"]';
+      const inputs = await page.$$(inputSel);
+      if (inputs.length === 0) throw new Error('SJF_LAYOUT_CHANGED: selector de búsqueda ausente');
       await inputs[0].fill(termino);
       await inputs[0].press('Enter');
       await page.waitForTimeout(3000);
-    }
 
-    const registros = await page.evaluate((max: number) => {
-      const found: string[] = [];
-      const links = Array.from(document.querySelectorAll('a[href*="/detalle/tesis/"]'));
-      for (const link of links) {
-        const m = (link as HTMLAnchorElement).href.match(/\/detalle\/tesis\/(\d+)/);
-        if (m && !found.includes(m[1])) {
-          found.push(m[1]);
-          if (found.length >= max * 2) break;
+      const registros = await page.evaluate((limit: number) => {
+        const found: string[] = [];
+        const links = Array.from(document.querySelectorAll('a[href*="/detalle/tesis/"]'));
+        for (const link of links) {
+          const m = (link as HTMLAnchorElement).href.match(/\/detalle\/tesis\/(\d+)/);
+          if (m && !found.includes(m[1])) {
+            found.push(m[1]);
+            if (found.length >= limit * 2) break;
+          }
         }
-      }
-      return found;
-    }, max);
+        return found;
+      }, max);
 
-    return registros.filter(r => !yaVistos.has(r)).slice(0, max);
-  } catch {
-    return [];
+      traces.push({
+        portal: portal.id, url, attempt: 1, started_at: started,
+        finished_at: new Date().toISOString(), status: 'SUCCESS',
+        message: registros.length ? `${registros.length} resultado(s)` : '0 resultados',
+      });
+      return { registros: registros.filter(r => !yaVistos.has(r)).slice(0, max), traces };
+    } catch (error) {
+      const failure = classifySjfFailure(error);
+      traces.push({
+        portal: portal.id, url, attempt: 1, started_at: started,
+        finished_at: new Date().toISOString(), status: 'FAILED',
+        failure_class: failure,
+        message: (error as Error).message.slice(0, 240),
+      });
+      console.warn(`  [FALLBACK] búsqueda en ${portal.id}: ${failure}`);
+    }
   }
+  return { registros: [], traces };
 }
 
 // ── AUDITAR UN REGISTRO ───────────────────────────────────────────────────────
-function tesisError(registro: string, url: string, esPropuesta: boolean, busquedaOrigen: string): TesisVVCA {
+function tesisError(
+  registro: string, url: string, esPropuesta: boolean, busquedaOrigen: string,
+  attempts: SjfAttemptTrace[],
+): TesisVVCA {
+  const estadoConsulta = aggregateFailureStatus(attempts);
+  const ausenciaConfirmada = estadoConsulta === 'NO_ENCONTRADO';
   return {
-    registro, rubro: 'ERROR — no se pudo conectar al SJF', numero_tesis: '', tipo_tesis: '',
+    registro,
+    rubro: ausenciaConfirmada ? 'NO ENCONTRADA EN LOS PORTALES SJF' : 'NO VERIFICABLE — consulta SJF fallida',
+    numero_tesis: '', tipo_tesis: '',
     sala: '', epoca: '', materia: '', fuente: '', texto_completo: '',
     estado_vigencia: 'vigente', notas_vigencia: '',
     url, screenshot: '',
     score_tipo: 0, score_relevancia: 0, score_combinado: 0,
-    vvca_semaforo: '🔴', vvca_observacion: 'Error de conexión al SJF.',
-    estado: 'DESCARTADO', razon_estado: 'Error al conectar con SJF (tras reintentos).',
+    vvca_semaforo: ausenciaConfirmada ? '🔴' : '🟡',
+    vvca_observacion: ausenciaConfirmada
+      ? 'Registro no encontrado tras consultar ambos portales públicos.'
+      : 'No verificable por fallo técnico; no equivale a cita falsa.',
+    estado: 'DESCARTADO',
+    razon_estado: ausenciaConfirmada
+      ? 'Ausencia confirmada en ambos portales públicos del SJF.'
+      : `Consulta no concluyente (${estadoConsulta}); verificar manualmente.`,
     petitorio_sugerido: '', forma_cita: 'NO CITAR',
     es_propuesta: esPropuesta, busqueda_origen: busquedaOrigen || undefined,
+    estado_consulta: estadoConsulta,
+    origen_consulta: 'ninguno',
+    consultado_en: new Date().toISOString(),
+    trazabilidad_consulta: { schema_version: '1.0', attempts },
   };
 }
 
 // Una navegación al detalle SJF → datos crudos + screenshot (requiere la página viva).
 async function extraerDatosSJF(page: Page, registro: string, url: string, screenshotPath: string): Promise<DatosSJF> {
-  await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
-  await page.waitForFunction(
-    () => document.body.innerText.includes('Registro digital:'),
-    { timeout: 30000 }
-  );
+  const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  if (response?.status() === 403) throw new Error('SJF_ACCESS_BLOCKED: HTTP 403');
+  if (response?.status() === 404) throw new Error('SJF_NOT_FOUND: HTTP 404');
+  await page.waitForTimeout(2500);
+  const bodyText = await page.locator('body').innerText({ timeout: 10000 });
+  if (/acceso denegado|access denied|forbidden/i.test(bodyText)) {
+    throw new Error('SJF_ACCESS_BLOCKED: respuesta de acceso denegado');
+  }
+  if (/tesis no encontrada|registro no encontrado|sin resultados/i.test(bodyText)) {
+    throw new Error('SJF_NOT_FOUND: el portal no encontró el registro');
+  }
+  if (!bodyText.includes('Registro digital:')) {
+    throw new Error('SJF_LAYOUT_CHANGED: marcador Registro digital ausente');
+  }
   const datos = await page.evaluate((reg: string) => {
       const lineas = document.body.innerText.split('\n').map((l: string) => l.trim()).filter(Boolean);
       const get = (clave: string) => {
@@ -379,29 +445,44 @@ async function extraerDatosSJF(page: Page, registro: string, url: string, screen
 
   await page.addStyleTag({ content: '.alert,[class*="alert"],.cookie-banner{display:none!important}' });
   await page.screenshot({ path: screenshotPath, fullPage: false });
-  return datos;
+  return { ...datos, origen_url: url, capturado_en: new Date().toISOString() };
 }
 
-// Scrapea con reintentos: el SJF a veces tarda o corta la conexión bajo carga.
-async function scrapearConReintentos(
-  ctx: BrowserContext, registro: string, url: string, screenshotPath: string, intentos = 2,
-): Promise<DatosSJF> {
-  let ultimo: Error | null = null;
-  for (let i = 1; i <= intentos; i++) {
-    const page = await ctx.newPage();
-    try {
-      return await extraerDatosSJF(page, registro, url, screenshotPath);
-    } catch (err) {
-      ultimo = err as Error;
-      if (i < intentos) {
-        console.log(`  [RETRY ${i}/${intentos - 1}] ${registro} — ${ultimo.message.slice(0, 60)}`);
-        await new Promise(r => setTimeout(r, 1500 * i));
+// Reintenta cada portal público y cae de sjf2 a sjfsemanal sin ocultar el motivo del fallo.
+async function scrapearConFallback(
+  ctx: BrowserContext, registro: string, screenshotPath: string, intentos = 2,
+): Promise<ScrapeFallbackResult> {
+  const attempts: SjfAttemptTrace[] = [];
+  for (const portal of SJF_PORTALS) {
+    const url = buildDetailUrl(portal, registro);
+    for (let attempt = 1; attempt <= intentos; attempt++) {
+      const page = await ctx.newPage();
+      const started = new Date().toISOString();
+      try {
+        const datos = await extraerDatosSJF(page, registro, url, screenshotPath);
+        attempts.push({
+          portal: portal.id, url, attempt, started_at: started,
+          finished_at: new Date().toISOString(), status: 'SUCCESS',
+        });
+        return { ok: true, datos, portal, url, attempts };
+      } catch (error) {
+        const failure = classifySjfFailure(error);
+        attempts.push({
+          portal: portal.id, url, attempt, started_at: started,
+          finished_at: new Date().toISOString(), status: 'FAILED',
+          failure_class: failure,
+          message: (error as Error).message.slice(0, 240),
+        });
+        console.warn(`  [${portal.id} ${attempt}/${intentos}] ${registro} — ${failure}`);
+        if (failure === 'NOT_FOUND') break;
+        if (attempt < intentos) await sleep(1500 * attempt);
+      } finally {
+        await page.close();
       }
-    } finally {
-      await page.close();
     }
+    console.warn(`  [FALLBACK] ${registro} — cambiando de ${portal.id} al siguiente portal público.`);
   }
-  throw ultimo ?? new Error('scrape SJF falló');
+  return { ok: false, url: buildDetailUrl(SJF_PORTALS[0], registro), attempts };
 }
 
 async function auditarRegistro(
@@ -411,8 +492,11 @@ async function auditarRegistro(
   esPropuesta = false,
   busquedaOrigen = ''
 ): Promise<TesisVVCA> {
-  const url            = `https://sjf2.scjn.gob.mx/detalle/tesis/${registro}`;
+  let url              = buildDetailUrl(SJF_PORTALS[0], registro);
   const screenshotPath = path.join(OUT_DIR, `sjf_${registro}.png`);
+  let attempts: SjfAttemptTrace[] = [];
+  let origenConsulta: TesisVVCA['origen_consulta'] = 'ninguno';
+  let consultadoEn = new Date().toISOString();
 
   // 1) Caché por registro (resiliencia + no martillar el SJF).
   const cacheEdadDias = USAR_CACHE ? edadCacheDias(registro) : -1;
@@ -420,17 +504,34 @@ async function auditarRegistro(
   const desdeCache = !!datos;
   if (datos) {
     console.log(`  [CACHE] ${registro} — copia local (sin tocar el SJF).`);
+    url = datos.origen_url || url;
+    consultadoEn = datos.capturado_en || consultadoEn;
+    origenConsulta = 'cache';
+    attempts = [{
+      portal: 'cache', url, attempt: 1,
+      started_at: consultadoEn, finished_at: consultadoEn, status: 'CACHE_HIT',
+    }];
   } else {
     console.log(`  [${esPropuesta ? 'PROPUESTA' : 'AUDIT'}] ${registro} — conectando SJF...`);
-    try {
-      datos = await scrapearConReintentos(ctx, registro, url, screenshotPath);
-    } catch (err) {
-      console.error(`  [ERROR] ${registro}:`, (err as Error).message);
-      return tesisError(registro, url, esPropuesta, busquedaOrigen);
+    const scrape = await scrapearConFallback(ctx, registro, screenshotPath);
+    attempts = scrape.attempts;
+    if (!scrape.ok) {
+      console.error(`  [ERROR] ${registro}: ${aggregateFailureStatus(attempts)}`);
+      return tesisError(registro, scrape.url, esPropuesta, busquedaOrigen, attempts);
     }
+    datos = scrape.datos;
+    url = scrape.url;
+    origenConsulta = scrape.portal.id;
+    consultadoEn = datos.capturado_en || new Date().toISOString();
     // 2) Detección de cambio de layout: campos clave vacíos ⇒ el DOM del SJF pudo cambiar.
     if (!datos.rubro && !datos.numero_tesis) {
       console.warn(`  [LAYOUT?] ${registro} — rubro y número vacíos; posible cambio de estructura del SJF (no se cachea).`);
+      attempts.push({
+        portal: scrape.portal.id, url, attempt: 1,
+        started_at: consultadoEn, finished_at: new Date().toISOString(), status: 'FAILED',
+        failure_class: 'LAYOUT_CHANGED', message: 'Rubro y número de tesis vacíos',
+      });
+      return tesisError(registro, url, esPropuesta, busquedaOrigen, attempts);
     } else {
       escribirCacheDatos(registro, datos);
     }
@@ -470,6 +571,10 @@ async function auditarRegistro(
     estado, razon_estado: razon,
     petitorio_sugerido: petitorio, forma_cita,
     es_propuesta: esPropuesta, busqueda_origen: busquedaOrigen || undefined,
+    estado_consulta: 'VERIFICADO',
+    origen_consulta: origenConsulta,
+    consultado_en: consultadoEn,
+    trazabilidad_consulta: { schema_version: '1.0', attempts },
   };
 }
 
@@ -524,6 +629,7 @@ async function main() {
   // aunque algo falle a media ejecución (se guarda lo que se haya alcanzado a auditar).
   const verificados: TesisVVCA[] = [];
   const propuestas: TesisVVCA[] = [];
+  const trazasBusqueda: SjfAttemptTrace[] = [];
 
   try {
     const ctx = await browser.newContext({
@@ -550,9 +656,10 @@ async function main() {
           const terminos = terminesBusquedaAlternativos(casoCtx, descartados);
 
           for (const termino of terminos) {
-            const candidatos = await buscarCandidatosSJF(searchPage, termino, 4, yaVistos);
+            const busqueda = await buscarCandidatosSJF(searchPage, termino, 4, yaVistos);
+            trazasBusqueda.push(...busqueda.traces);
             await delayAntiRateLimit();
-            for (const reg of candidatos) {
+            for (const reg of busqueda.registros) {
               yaVistos.add(reg);
               const tesis = await auditarRegistro(ctx, reg, casoCtx, true, termino);
               await delayAntiRateLimit();
@@ -576,7 +683,18 @@ async function main() {
   }
 
   // ── SALIDA JSON ───────────────────────────────────────────────────────────
-  const salida = { verificados, propuestas };
+  const salida = {
+    schema_version: '2.0',
+    generado_en: new Date().toISOString(),
+    politica_fuentes: {
+      portales_publicos: SJF_PORTALS.map(p => p.baseUrl),
+      api_interna: 'NO_CONSUMIDA',
+      razon: 'Contrato técnico no documentado públicamente; se usan únicamente interfaces públicas.',
+    },
+    verificados,
+    propuestas,
+    consultas_busqueda: trazasBusqueda,
+  };
   const jsonPath = path.join(OUT_DIR, 'auditoria_vvca.json');
   fs.writeFileSync(jsonPath, JSON.stringify(salida, null, 2), 'utf-8');
 
@@ -594,6 +712,7 @@ async function main() {
     console.log(`   Materia:   ${t.materia}`);
     console.log(`   Rubro:     ${t.rubro.slice(0, 110)}`);
     console.log(`   Estado:    ${t.estado} — ${t.razon_estado}`);
+    console.log(`   Consulta:  ${t.estado_consulta} vía ${t.origen_consulta}`);
     console.log(`   Cita:      ${t.forma_cita}`);
     if (t.es_propuesta) console.log(`   Origen:    Busqueda "${t.busqueda_origen}"`);
     console.log();
