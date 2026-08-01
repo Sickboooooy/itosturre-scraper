@@ -5,3 +5,13 @@ tesis_final.json
 .env
 .sjf_cache/
 _vigbuild/
+
+# Prospectos B2B y materiales de contacto — datos locales, nunca versionar
+leads_data/
+data/leads/
+exports/leads/
+*_leads.csv
+*prospectos*.csv
+prueba_busqueda_*.csv
+cola_manual_*.csv
+mensajes_manual_*.md
