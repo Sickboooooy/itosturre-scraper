@@ -19,6 +19,7 @@ import {
   buildDetailUrl,
   buildSearchUrl,
   classifySjfFailure,
+  esperarDesafioAntiBots,
   type SjfAttemptTrace,
   type SjfPortal,
 } from './sjf_resilience.ts';
@@ -304,9 +305,12 @@ async function buscarCandidatosSJF(
     const started = new Date().toISOString();
     try {
       const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-      if (response?.status() === 403) throw new Error('SJF_ACCESS_BLOCKED: HTTP 403');
       if (response?.status() === 404) throw new Error('SJF_NOT_FOUND: HTTP 404');
       await page.waitForTimeout(2500);
+      // Un 403 puede ser el desafío anti-bots (lo resuelve el propio sitio) o un bloqueo real.
+      if ((await esperarDesafioAntiBots(page)) === 'SIN_DESAFIO' && response?.status() === 403) {
+        throw new Error('SJF_ACCESS_BLOCKED: HTTP 403');
+      }
 
       const inputSel = 'input[type="text"], input[type="search"]';
       const inputs = await page.$$(inputSel);
@@ -383,9 +387,12 @@ function tesisError(
 // Una navegación al detalle SJF → datos crudos + screenshot (requiere la página viva).
 async function extraerDatosSJF(page: Page, registro: string, url: string, screenshotPath: string): Promise<DatosSJF> {
   const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  if (response?.status() === 403) throw new Error('SJF_ACCESS_BLOCKED: HTTP 403');
   if (response?.status() === 404) throw new Error('SJF_NOT_FOUND: HTTP 404');
   await page.waitForTimeout(2500);
+  // Un 403 puede ser el desafío anti-bots (lo resuelve el propio sitio) o un bloqueo real.
+  if ((await esperarDesafioAntiBots(page)) === 'SIN_DESAFIO' && response?.status() === 403) {
+    throw new Error('SJF_ACCESS_BLOCKED: HTTP 403');
+  }
   const bodyText = await page.locator('body').innerText({ timeout: 10000 });
   if (/acceso denegado|access denied|forbidden/i.test(bodyText)) {
     throw new Error('SJF_ACCESS_BLOCKED: respuesta de acceso denegado');
