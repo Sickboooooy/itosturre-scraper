@@ -126,3 +126,72 @@ export async function esperarDesafioAntiBots(
   }
   throw new Error('SJF_ACCESS_CHALLENGE: el desafío anti-bots del sitio no se resolvió a tiempo');
 }
+
+// ── Época y fuente de la ficha de la tesis ────────────────────────────────────
+
+const EPOCA_POR_SUFIJO: Record<string, string> = {
+  '5a.': 'Quinta Época', '6a.': 'Sexta Época', '7a.': 'Séptima Época', '8a.': 'Octava Época',
+  '9a.': 'Novena Época', '10a.': 'Décima Época', '11a.': 'Undécima Época', '12a.': 'Duodécima Época',
+};
+const LINEA_EPOCA = /^(Quinta|Sexta|S[ée]ptima|Octava|Novena|D[ée]cima|Und[ée]cima|Duod[ée]cima)\s+[ÉE]poca$/i;
+
+/** Época de la tesis leída del bloque de datos (desde "Registro digital:"). Nunca del
+ *  encabezado del portal: ese anuncia la época VIGENTE del Semanario, no la de la tesis. */
+export function epocaDeFicha(lineas: readonly string[]): string {
+  const inicio = lineas.findIndex(l => /^Registro digital\s*:/i.test(l.trim()));
+  if (inicio === -1) return '';
+  return lineas.slice(inicio).map(l => l.trim()).find(l => LINEA_EPOCA.test(l)) ?? '';
+}
+
+/** Época que declara la clave de la tesis: "1a./J. 24/2014 (10a.)" → "Décima Época". */
+export function epocaDeClave(clave: string): string {
+  const m = /\((\d{1,2}a\.)\)\s*$/.exec((clave ?? '').trim());
+  return m ? EPOCA_POR_SUFIJO[m[1]] ?? '' : '';
+}
+
+/** Fuente completa: la línea "Fuente:" más sus continuaciones (Libro, Tomo, página). */
+export function fuenteDeFicha(lineas: readonly string[]): string {
+  const i = lineas.findIndex(l => /^Fuente\s*:/i.test(l.trim()));
+  if (i === -1) return '';
+  const partes = [lineas[i].trim().replace(/^Fuente\s*:\s*/i, '')];
+  for (const linea of lineas.slice(i + 1, i + 3).map(l => l.trim())) {
+    if (/^(Libro|Tomo|Volumen|Parte)\b/i.test(linea) || /p[áa]gina\s+\d/i.test(linea)) partes.push(linea);
+    else break;
+  }
+  return partes.filter(Boolean).join(' ');
+}
+
+// ── Ficha cargada ─────────────────────────────────────────────────────────────
+
+const FICHA_CON_REGISTRO = /Registro digital\s*:\s*\d{4,}/i;
+const FICHA_NO_ENCONTRADA = /tesis no encontrada|registro no encontrado|sin resultados/i;
+
+/**
+ * El portal pinta primero la plantilla de la ficha ("Registro digital: -1") y después la llena.
+ * Se espera a que aparezca el número de registro real (o el aviso de no encontrada, que
+ * clasifica quien llama). Si vence el plazo con la plantilla vacía, es TIMEOUT —reintentable—;
+ * solo si ni siquiera está el marcador de la ficha es cambio de layout.
+ */
+export async function esperarFichaCargada(
+  leerTexto: () => Promise<string>,
+  esperar: (ms: number) => Promise<void>,
+  { timeoutMs = 20000, pasoMs = 500, asentarMs = 800, ahora = Date.now }:
+    { timeoutMs?: number; pasoMs?: number; asentarMs?: number; ahora?: () => number } = {},
+): Promise<void> {
+  const inicio = ahora();
+  let texto = '';
+  while (ahora() - inicio < timeoutMs) {
+    texto = await leerTexto().catch(() => '');
+    if (FICHA_NO_ENCONTRADA.test(texto)) return;
+    if (FICHA_CON_REGISTRO.test(texto)) {
+      await esperar(asentarMs);  // un respiro para que termine de pintar el resto de la ficha
+      return;
+    }
+    await esperar(pasoMs);
+  }
+  if (!/Registro digital\s*:/i.test(texto)) {
+    throw new Error('SJF_LAYOUT_CHANGED: marcador Registro digital ausente');
+  }
+  throw new Error('SJF_TIMEOUT: el detalle de la tesis no terminó de cargar (plantilla sin número de registro)');
+}
+

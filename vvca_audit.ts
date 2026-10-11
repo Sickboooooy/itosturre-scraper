@@ -19,7 +19,11 @@ import {
   buildDetailUrl,
   buildSearchUrl,
   classifySjfFailure,
+  epocaDeClave,
+  epocaDeFicha,
   esperarDesafioAntiBots,
+  esperarFichaCargada,
+  fuenteDeFicha,
   type SjfAttemptTrace,
   type SjfPortal,
 } from './sjf_resilience.ts';
@@ -393,6 +397,10 @@ async function extraerDatosSJF(page: Page, registro: string, url: string, screen
   if ((await esperarDesafioAntiBots(page)) === 'SIN_DESAFIO' && response?.status() === 403) {
     throw new Error('SJF_ACCESS_BLOCKED: HTTP 403');
   }
+  await esperarFichaCargada(
+    () => page.evaluate(() => document.body.innerText),
+    (ms: number) => page.waitForTimeout(ms),
+  );
   const bodyText = await page.locator('body').innerText({ timeout: 10000 });
   if (/acceso denegado|access denied|forbidden/i.test(bodyText)) {
     throw new Error('SJF_ACCESS_BLOCKED: respuesta de acceso denegado');
@@ -422,7 +430,10 @@ async function extraerDatosSJF(page: Page, registro: string, url: string, screen
         : '';
       const materia = lineas.find((l: string) => /^Materia/i.test(l))
         ?.replace(/^Materia\([^)]*\)\s*:\s*/i, '').replace(/^Materia\s*:\s*/i, '') ?? '';
-      const epocaFull = lineas.find((l: string) => /época/i.test(l) && !/materia|instancia/i.test(l)) ?? '';
+      // La época y la fuente se resuelven fuera del navegador (epocaDeFicha / fuenteDeFicha):
+      // aquí solo se devuelve el bloque de datos de la tesis.
+      const regIdx = lineas.findIndex((l: string) => /^Registro digital\s*:/i.test(l));
+      const lineas_ficha = regIdx === -1 ? [] : lineas.slice(regIdx, regIdx + 30);
 
       // Sección NOTAS/EJECUTORIAS (donde el SJF publica la pérdida de vigencia). Se corta al
       // llegar al pie institucional. Si no hay sección rotulada, se rescatan líneas
@@ -445,14 +456,17 @@ async function extraerDatosSJF(page: Page, registro: string, url: string, screen
         registro: reg, rubro,
         numero_tesis: lineas.find((l: string) => /^Tesis\s*:/i.test(l))?.replace(/^Tesis\s*:\s*/i,'') ?? '',
         tipo_tesis: get('Tipo'),
-        sala: get('Instancia'), epoca: epocaFull.replace(/\s*".*"$/,'').trim(),
-        materia, fuente: get('Fuente'), texto_completo, notas_raw,
+        sala: get('Instancia'), epoca: '',
+        materia, fuente: get('Fuente'), texto_completo, notas_raw, lineas_ficha,
       };
-    }, registro) as DatosSJF;
+    }, registro) as DatosSJF & { lineas_ficha: string[] };
+  const { lineas_ficha, ...ficha } = datos;
+  ficha.epoca = epocaDeFicha(lineas_ficha) || epocaDeClave(ficha.numero_tesis);
+  ficha.fuente = fuenteDeFicha(lineas_ficha) || ficha.fuente;
 
   await page.addStyleTag({ content: '.alert,[class*="alert"],.cookie-banner{display:none!important}' });
   await page.screenshot({ path: screenshotPath, fullPage: false });
-  return { ...datos, origen_url: url, capturado_en: new Date().toISOString() };
+  return { ...ficha, origen_url: url, capturado_en: new Date().toISOString() };
 }
 
 // Reintenta cada portal público y cae de sjf2 a sjfsemanal sin ocultar el motivo del fallo.

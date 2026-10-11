@@ -4,8 +4,12 @@ import {
   aggregateFailureStatus,
   buildDetailUrl,
   classifySjfFailure,
+  epocaDeClave,
+  epocaDeFicha,
   esDesafioAntiBots,
   esperarDesafioAntiBots,
+  esperarFichaCargada,
+  fuenteDeFicha,
   type PaginaSjf,
   type SjfAttemptTrace,
 } from './sjf_resilience.js';
@@ -103,6 +107,79 @@ check('si no se resuelve, falla como ACCESS_CHALLENGE',
   errorPersistente !== null && classifySjfFailure(errorPersistente) === 'ACCESS_CHALLENGE');
 check('no insiste: una sola recarga y se rinde al vencer el plazo',
   persistente.recargas === 1 && persistente.reloj >= 20000 && persistente.reloj < 25000);
+
+// ── Época y fuente de la ficha ─────────────────────────────────────────────────
+// Observado el 10-oct-2026 en 12 registros: el encabezado del portal anuncia la época VIGENTE
+// del Semanario ("Duodécima Época …") y el scraper la tomaba como época de cada tesis, incluso
+// de una de la Novena. La fuente perdía su segunda línea (Libro, Tomo, página).
+const LINEAS_PAGINA = [
+  'Semanario Judicial de la Federación',
+  'Tercer periodo "De la Justicia con el Pueblo"',
+  'Duodécima Época "De la Justicia Pluricultural, la Igualdad Sustantiva y la Inclusión en México"',
+  'Tesis',
+  'Registro digital: 2006092',
+  'Instancia: Primera Sala',
+  'Décima Época',
+  'Materia(s): Constitucional, Penal',
+  'Tesis: 1a./J. 24/2014 (10a.)',
+  'Fuente: Gaceta del Semanario Judicial de la Federación.',
+  'Libro 5, Abril de 2014, Tomo I, página 497',
+  'Tipo: Jurisprudencia',
+  'PRESUNCIÓN DE INOCENCIA COMO REGLA DE TRATO PROCESAL.',
+];
+check('la época sale del bloque de la tesis, no del encabezado del portal',
+  epocaDeFicha(LINEAS_PAGINA) === 'Décima Época');
+check('sin bloque de datos no hay época que leer', epocaDeFicha(LINEAS_PAGINA.slice(0, 4)) === '');
+check('época por la clave (10a.)', epocaDeClave('1a./J. 24/2014 (10a.)') === 'Décima Época');
+check('época por la clave (9a.)', epocaDeClave('1a. CXCII/2011 (9a.)') === 'Novena Época');
+check('época por la clave (12a.)', epocaDeClave('PR.P.T.CN. J/1 P (12a.)') === 'Duodécima Época');
+check('clave sin época', epocaDeClave('sin sufijo') === '');
+check('la fuente conserva Libro, Tomo y página',
+  fuenteDeFicha(LINEAS_PAGINA) === 'Gaceta del Semanario Judicial de la Federación. Libro 5, Abril de 2014, Tomo I, página 497');
+check('fuente de una sola línea', fuenteDeFicha(['Fuente: Semanario Judicial de la Federación.', 'Tipo: Aislada'])
+  === 'Semanario Judicial de la Federación.');
+
+// ── Ficha cargada ──────────────────────────────────────────────────────────────
+// Observado el 10-oct-2026: tras resolverse el desafío, el portal pinta primero la plantilla
+// ("Registro digital: -1", campos vacíos) y luego llena los datos. Leer en ese momento daba
+// rubro y número vacíos, y se reportaba como cambio de layout.
+function lector(textos: string[]) {
+  let reloj = 0;
+  return {
+    leer: async () => (textos.length > 1 ? textos.shift()! : textos[0]),
+    esperar: async (ms: number) => { reloj += ms; },
+    ahora: () => reloj,
+  };
+}
+const PLANTILLA = 'Tesis\nRegistro digital: -1\nInstancia:\nTesis:';
+const CARGADA = 'Tesis\nRegistro digital: 160794\nInstancia: Primera Sala\nTesis: 1a. CXCII/2011 (9a.)';
+
+const yaCargada = lector([CARGADA]);
+let errorCarga: unknown = null;
+try { await esperarFichaCargada(yaCargada.leer, yaCargada.esperar, { ahora: yaCargada.ahora }); } catch (e) { errorCarga = e; }
+check('ficha ya cargada: sigue de inmediato', errorCarga === null);
+
+const tardaEnCargar = lector([PLANTILLA, PLANTILLA, CARGADA]);
+errorCarga = null;
+try { await esperarFichaCargada(tardaEnCargar.leer, tardaEnCargar.esperar, { ahora: tardaEnCargar.ahora }); } catch (e) { errorCarga = e; }
+check('espera a que la plantilla se llene con el registro real', errorCarga === null);
+
+const nuncaCarga = lector([PLANTILLA]);
+errorCarga = null;
+try { await esperarFichaCargada(nuncaCarga.leer, nuncaCarga.esperar, { ahora: nuncaCarga.ahora }); } catch (e) { errorCarga = e; }
+check('plantilla que nunca se llena es TIMEOUT (reintentable), no cambio de layout',
+  errorCarga !== null && classifySjfFailure(errorCarga) === 'TIMEOUT');
+
+const sinMarcador = lector(['Página distinta sin ficha']);
+errorCarga = null;
+try { await esperarFichaCargada(sinMarcador.leer, sinMarcador.esperar, { ahora: sinMarcador.ahora }); } catch (e) { errorCarga = e; }
+check('sin el marcador de ficha sí es cambio de layout',
+  errorCarga !== null && classifySjfFailure(errorCarga) === 'LAYOUT_CHANGED');
+
+const noExiste = lector(['Tesis no encontrada']);
+errorCarga = null;
+try { await esperarFichaCargada(noExiste.leer, noExiste.esperar, { ahora: noExiste.ahora }); } catch (e) { errorCarga = e; }
+check('registro inexistente: no se espera, decide quien llama (NOT_FOUND)', errorCarga === null);
 
 console.log(fails === 0
   ? '\n🟢 resilience.test OK — fallback y clasificación correctos.'
