@@ -15,3 +15,6 @@ exports/leads/
 prueba_busqueda_*.csv
 cola_manual_*.csv
 mensajes_manual_*.md
+
+# Salida de buscar_sjf.ts: se regenera en cada búsqueda
+busqueda_sjf.json
